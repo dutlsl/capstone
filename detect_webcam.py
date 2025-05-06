@@ -1,94 +1,111 @@
 import cv2, time, collections
 from ultralytics import YOLO
 
-# ────────────────────────── 설정값 ──────────────────────────
-MODEL_PATH   = "yolov5n.pt"   # 학습된 가중치
-DEVICE_IDX   = 0              # 카메라 인덱스
-CONF_THRES   = 0.30
-HIST_LEN     = 10             # 최근 N프레임 저장
-V_REF_PIXELS = 200            # '매우 빠른 접근' 기준 속도(px/s)
-# ───────────────────────────────────────────────────────────
+# ──────────── 사용자 설정 ────────────
+MODEL     = "yolov5n.pt"
+CAM_IDX   = 0
+CONF      = 0.35
+FPS_EST   = 30              # 카메라 실제 FPS
+MIN_AREA  = 8000            # 너무 작은 박스 무시
+CENTER_ROI = 0.4            # 화면 중앙 40% 만 사용
+V_REF     = 250             # px/s (캠 해상도 640×480 기준)
+WIN_SIZE  = 8               # 최근 0.5 s (8프레임) 이동 평균
+UP_REQUIRE = 3              # 위험 승급엔 연속 3프레임 필요
+DOWN_DELAY = 30             # 1 s 연속 안전 시 하강
+TRIGGER_LVL = 7             # 진동 시작 위험도
+# ────────────────────────────────────
 
-model = YOLO(MODEL_PATH)
+model = YOLO(MODEL)
 cap   = cv2.VideoCapture(0)
-
 if not cap.isOpened():
-    print("Cannot open webcam")
-    exit()
+    raise RuntimeError("Cannot open webcam")
 
-# (timestamp, area, cy) 히스토리
-history = collections.deque(maxlen=HIST_LEN)
+hist = collections.deque(maxlen=WIN_SIZE)           # (t, area, cy)
+consecutive_approach = 0
+consecutive_safe     = 0
+risk_level           = 1
 
-def norm_speed(area_now, cy_now, t_now):
-    """정규화 속도 s(0~1)와 접근 여부 반환"""
-    if not history:
-        return 0.0, False
-    t_prev, area_prev, cy_prev = history[-1]
-    dt = t_now - t_prev
-    if dt == 0 or area_prev == 0:
-        return 0.0, False
+def danger_mapping(s_norm):
+    # 간단 단계표 : 높은 속도에만 높은 레벨
+    if s_norm < 0.20: return 3
+    if s_norm < 0.35: return 5
+    if s_norm < 0.55: return 6
+    if s_norm < 0.75: return 7
+    if s_norm < 0.90: return 8
+    return 9
 
-    ratio = area_now / area_prev
-    vy    = (cy_now - cy_prev) / dt       # 음수이면 카메라 방향
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    t_now = time.time()
 
-    approach = (ratio > 1.02) or (vy < -5)
-    s        = min(1.0, abs(vy) / V_REF_PIXELS)
-    return s, approach
+    results = model(frame, conf=CONF)
+    h, w, _ = frame.shape
+    x_min, x_max = int(w*(0.5-CENTER_ROI/2)), int(w*(0.5+CENTER_ROI/2))
 
-def risk_score(s, approach):
-    """정규화 속도·접근 여부 → 위험도 1~10"""
-    if not approach:
-        return 1 if s < 0.10 else 2 if s < 0.25 else 3
-    if s < 0.10:  return 1
-    if s < 0.25:  return 3
-    if s < 0.40:  return 4
-    if s < 0.55:  return 5
-    if s < 0.70:  return 6
-    if s < 0.80:  return 7
-    if s < 0.90:  return 8
-    if s < 0.97:  return 9
-    return 10
+    target = None
+    # 가장 큰 차량·오토바이·자전거 중 중앙 영역에 있는 것 1개
+    for box in results[0].boxes:
+        cls = results[0].names[int(box.cls[0])]
+        if cls not in ('car', 'motorcycle', 'bicycle'):
+            continue
+        x1,y1,x2,y2 = map(int, box.xyxy[0])
+        if x2 < x_min or x1 > x_max:
+            continue                              # ROI 밖
+        area = (x2-x1)*(y2-y1)
+        if area < MIN_AREA:
+            continue
+        if target is None or area > target['area']:
+            target = {'cls':cls, 'area':area, 'cx':(x1+x2)/2, 'cy':(y1+y2)/2}
 
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Failed to grab frame")
-            break
-
-        t_now  = time.time()
-        results = model(frame, conf=CONF_THRES)
-        annotated = results[0].plot()
-
-        # 관심 객체 중 가장 큰 박스 1개만 평가
-        target_area, target_box, target_cls = 0, None, ""
-        for box in results[0].boxes:
-            cls_name = results[0].names[int(box.cls[0])]
-            if cls_name not in ('car', 'motorcycle', 'bicycle'):
-                continue
-            x1,y1,x2,y2 = box.xyxy[0]
-            area = (x2-x1)*(y2-y1)
-            if area > target_area:
-                target_area, target_box, target_cls = area, (x1,y1,x2,y2), cls_name
-
-        if target_box is not None:
-            x1,y1,x2,y2 = target_box
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
-
-            s, approach = norm_speed(target_area, cy, t_now)
-            score = risk_score(s, approach)
-            print(f"{target_cls} {score}")
-
-            history.append((t_now, target_area, cy))
+    if target:
+        area, cy = target['area'], target['cy']
+        # 이동 평균 계산
+        if hist:
+            dt   = t_now - hist[-1][0]
+            vy   = (cy - hist[-1][2]) / max(dt, 1e-3)
+            ratio = area / hist[-1][1]
         else:
-            history.clear()            # 대상 없으면 히스토리 초기화
-            print("none 1")
+            vy, ratio = 0, 1
+        hist.append((t_now, area, cy))
 
-        cv2.imshow("YOLO Detection", annotated)
-        if cv2.waitKey(1) & 0xFF == 27:    # ESC 키
-            break
+        # 최근 WIN_SIZE 프레임 평균 속도 px/s
+        if len(hist) >= 2:
+            vy_avg = abs((hist[-1][2] - hist[0][2]) / (hist[-1][0] - hist[0][0]))
+        else:
+            vy_avg = 0
+        s_norm = min(1.0, vy_avg / V_REF)
 
-finally:
-    cap.release()
-    cv2.destroyAllWindows()
+        # 접근 조건(둘 다 만족)
+        approaching = (ratio > 1.10) and (vy < -15)
+
+        if approaching:
+            consecutive_safe = 0
+            consecutive_approach += 1
+            if consecutive_approach >= UP_REQUIRE and risk_level < 10:
+                risk_level = max(risk_level, danger_mapping(s_norm))
+        else:
+            consecutive_approach = 0
+            consecutive_safe += 1
+            if consecutive_safe >= DOWN_DELAY and risk_level > 1:
+                risk_level -= 1
+                consecutive_safe = 0
+
+        print(f"{target['cls']} {risk_level}")
+        # 진동 모터 연동 시: if risk_level >= TRIGGER_LVL: pwm_on()
+    else:
+        hist.clear()
+        consecutive_approach = 0
+        consecutive_safe += 1
+        if consecutive_safe >= DOWN_DELAY and risk_level > 1:
+            risk_level -= 1
+            consecutive_safe = 0
+        print("none", risk_level)
+
+    cv2.imshow("Detection", results[0].plot())
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
